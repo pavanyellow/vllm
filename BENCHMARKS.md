@@ -1,69 +1,58 @@
 # Qwen/Qwen3.6-35B-A3B-FP8 — single-stream TTFT benchmarks
 
-Time-to-first-token (TTFT) at **concurrency 1** on a single **NVIDIA H100 80GB**,
-vLLM `0.1.dev17053+g7e53283b1`, FP8 weights. Server launched as documented in
-[`README.md`](./README.md) (`--max-model-len 32768`, prefix caching + chunked
-prefill on, thinking disabled).
+## Setup
 
-**Methodology**
+- Model: `Qwen/Qwen3.6-35B-A3B-FP8` (served as `Qwen/Qwen3.6-35B-A3B`), FP8.
+- Hardware: 1× NVIDIA H100 80GB.
+- vLLM `0.1.dev17053+g7e53283b1`, `torch 2.11.0+cu128`, CUDA 12.8, Python 3.12.
+- Server flags: `--max-model-len 32768 --gpu-memory-utilization 0.90
+  --enable-prefix-caching --enable-chunked-prefill --language-model-only
+  --reasoning-parser qwen3 --default-chat-template-kwargs '{"enable_thinking": false}'`.
+- Scheduler: `max_num_batched_tokens=8192`. Inputs longer than 8192 tokens are
+  prefilled in `ceil(input_len / 8192)` chunks.
 
-- Every prompt is unique random tokens → **0% prefix-cache hit rate** (verified in
-  server logs), so each request does a full prefill — the warm compute path, not
-  cache replays.
-- Single request in flight (concurrency 1). Warmup requests discarded.
-- TTFT = wall-clock from request send to first streamed token.
+## Methodology
 
----
+- Concurrency 1 (one request in flight).
+- Prompts are unique random token IDs (range 100–150000) sent as raw token IDs
+  via `/v1/completions` → exact input length, and 0% prefix-cache hit rate
+  (verified in server logs).
+- Sampling: `max_tokens` small, `temperature=0`, `ignore_eos=true`, `stream=true`.
+- TTFT = wall-clock from request send to first streamed token chunk.
+- Section A produced by [`ttft_sweep.py`](./ttft_sweep.py): 10 requests per length,
+  first 2 discarded as per-shape warmup, 5 output tokens.
+- Section B produced by `vllm bench serve` (`--dataset-name random
+  --random-output-len 1 --random-range-ratio 0 --random-prefix-len 0
+  --max-concurrency 1 --num-prompts 20`).
 
-## A. Input-length sweep, 100 → 5000 tokens
-
-Produced by [`ttft_sweep.py`](./ttft_sweep.py) (raw token IDs via `/v1/completions`,
-5 output tokens, 12 requests/length, first 2 discarded).
+## A. Input-length sweep, 256 → 32,000 tokens
 
 | input tokens | TTFT p50 (ms) | TTFT min (ms) | prefill tok/s (len/TTFT) |
 |---:|---:|---:|---:|
-| 100  | 24.4  | 24.1  | 4,096  |
-| 400  | 28.8  | 28.2  | 13,911 |
-| 700  | 81.8  | 81.5  | 8,555  |
-| 1000 | 83.7  | 82.4  | 11,945 |
-| 1300 | 102.6 | 101.5 | 12,676 |
-| 1600 | 161.7 | 158.4 | 9,897  |
-| 1900 | 163.7 | 157.9 | 11,606 |
-| 2200 | 104.9 | 101.7 | 20,973 |
-| 2500 | 110.2 | 108.2 | 22,687 |
-| 2800 | 162.5 | 161.0 | 17,229 |
-| 3100 | 164.2 | 161.2 | 18,874 |
-| 3400 | 107.4 | 106.4 | 31,670 |
-| 3700 | 165.3 | 162.4 | 22,378 |
-| 4000 | 165.9 | 163.6 | 24,105 |
-| 4300 | 109.1 | 107.8 | 39,407 |
-| 4600 | 114.4 | 113.7 | 40,220 |
-| 4900 | 166.7 | 166.1 | 29,396 |
-| 5000 | 167.8 | 167.3 | 29,791 |
+| 256    | 28.3  | 26.9  | 9,051  |
+| 512    | 33.4  | 30.1  | 15,331 |
+| 1,024  | 85.7  | 83.0  | 11,955 |
+| 1,536  | 106.8 | 106.6 | 14,377 |
+| 2,048  | 159.4 | 159.0 | 12,852 |
+| 3,072  | 162.9 | 161.9 | 18,855 |
+| 4,096  | 166.0 | 164.9 | 24,680 |
+| 5,120  | 171.1 | 167.8 | 29,927 |
+| 6,144  | 174.0 | 170.9 | 35,305 |
+| 8,192  | 178.8 | 177.4 | 45,815 |
+| 10,240 | 264.5 | 257.0 | 38,711 |
+| 12,288 | 280.7 | 268.9 | 43,779 |
+| 14,336 | 304.1 | 302.8 | 47,149 |
+| 16,384 | 399.6 | 396.1 | 41,000 |
+| 20,480 | 436.6 | 430.9 | 46,911 |
+| 24,576 | 535.0 | 527.8 | 45,940 |
+| 28,672 | 610.1 | 607.9 | 46,996 |
+| 32,000 | 695.8 | 694.0 | 45,991 |
 
-**Read.** No clean memory→compute knee appears in this range. TTFT stays low
-(≤ ~170 ms) and **oscillates between a ~110 ms band and a ~165 ms band**. Within
-each length the spread is tight (min ≈ p50), so this is a *deterministic per-shape*
-effect — most likely CUDA-graph / attention-kernel tile alignment, not a roofline
-transition. Prefill remains weight-load-dominated (memory-bound) through 5k for
-this 3B-active hybrid (linear-attention + 1-in-4 full-attention) MoE; the
-compute-bound regime is beyond 5k tokens. Sweeping higher (16k–32k) would be
-needed to locate the actual transition.
+## B. Cross-check — `vllm bench serve`, 2k → 8k (concurrency 1, 1 output token)
 
-## B. Cross-check via `vllm bench serve` (random dataset)
-
-Same server, `--max-concurrency 1`, `--random-output-len 1`, `--random-range-ratio 0`,
-20 prompts/length.
-
-| input tokens | TTFT mean (ms) | TTFT p50 (ms) | P90 | P99 |
+| input tokens | TTFT mean (ms) | TTFT p50 (ms) | P90 (ms) | P99 (ms) |
 |---:|---:|---:|---:|---:|
-| 2048 | 186.4 | 186.3 | 193.6 | 207.1 |
-| 3072 | 208.5 | 195.5 | 206.2 | 417.8 |
-| 4096 | 215.2 | 215.7 | 230.0 | 233.8 |
-| 8192 | 225.4 | 217.7 | 250.4 | 293.5 |
-
-These run ~60–80 ms higher than Table A at comparable lengths because the
-`vllm bench serve` OpenAI client path carries more per-request overhead (request
-construction, response handling) than the lean raw-token client in `ttft_sweep.py`.
-Both agree on the qualitative result: **TTFT is nearly flat vs. input length at
-C=1** (only ~+30 ms from 2k→8k in Table B), confirming memory-bound prefill.
+| 2,048 | 186.4 | 186.3 | 193.6 | 207.1 |
+| 3,072 | 208.5 | 195.5 | 206.2 | 417.8 |
+| 4,096 | 215.2 | 215.7 | 230.0 | 233.8 |
+| 8,192 | 225.4 | 217.7 | 250.4 | 293.5 |
