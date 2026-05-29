@@ -26,12 +26,25 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 
 import requests
+from requests.adapters import HTTPAdapter
 
 DEFAULT_LENGTHS = sorted(set(list(range(100, 5001, 300)) + [5000]))
 VOCAB_LO, VOCAB_HI = 100, 150_000   # safe non-special token-id range
 
 
-def ttft_once(url: str, model: str, input_len: int, out_tokens: int) -> float:
+def make_session(pool_size: int) -> requests.Session:
+    # Persistent session => HTTP keep-alive, so we reuse one warm TCP connection
+    # per worker instead of paying a fresh connect/handshake on every request.
+    # pool_maxsize >= concurrency so concurrent threads don't contend for sockets.
+    s = requests.Session()
+    adapter = HTTPAdapter(pool_connections=pool_size, pool_maxsize=pool_size)
+    s.mount("http://", adapter)
+    s.mount("https://", adapter)
+    return s
+
+
+def ttft_once(session: requests.Session, url: str, model: str,
+              input_len: int, out_tokens: int) -> float:
     # fresh random token ids each call => unique prompt => no prefix-cache hit
     prompt_ids = random.choices(range(VOCAB_LO, VOCAB_HI), k=input_len)
     payload = {
@@ -43,7 +56,7 @@ def ttft_once(url: str, model: str, input_len: int, out_tokens: int) -> float:
         "ignore_eos": True,
     }
     t0 = time.perf_counter()
-    with requests.post(url, json=payload, stream=True) as r:
+    with session.post(url, json=payload, stream=True) as r:
         r.raise_for_status()
         for line in r.iter_lines():
             if not line:
@@ -64,11 +77,11 @@ def percentile(xs, q):
     return xs[i]
 
 
-def measure(url, model, length, out_tokens, rounds, warm, concurrency):
+def measure(session, url, model, length, out_tokens, rounds, warm, concurrency):
     samples = []
     with ThreadPoolExecutor(max_workers=concurrency) as ex:
         for rnd in range(rounds):
-            futs = [ex.submit(ttft_once, url, model, length, out_tokens)
+            futs = [ex.submit(ttft_once, session, url, model, length, out_tokens)
                     for _ in range(concurrency)]
             res = [f.result() for f in futs]
             if rnd >= warm:
@@ -102,10 +115,12 @@ def main():
     else:
         lengths = DEFAULT_LENGTHS
 
+    session = make_session(args.concurrency)
+
     print(f"concurrency={args.concurrency}")
     print(f"{'in_len':>7} {'TTFT_p50_ms':>12} {'TTFT_p90_ms':>12} {'TTFT_min_ms':>12}")
     for length in lengths:
-        s = measure(args.url, args.model, length, args.out_tokens,
+        s = measure(session, args.url, args.model, length, args.out_tokens,
                     args.n, args.warm, args.concurrency)
         p50 = percentile(s, 0.50) * 1000.0
         p90 = percentile(s, 0.90) * 1000.0
