@@ -56,3 +56,85 @@
 | 3,072 | 208.5 | 195.5 | 206.2 | 417.8 |
 | 4,096 | 215.2 | 215.7 | 230.0 | 233.8 |
 | 8,192 | 225.4 | 217.7 | 250.4 | 293.5 |
+
+## C. Dense single-stream sweeps (concurrency 1)
+
+Methodology as Section A (concurrency 1, unique random token-id prompts, 0%
+prefix-cache hit verified, TTFT = send → first streamed token), with finer
+length steps: `ttft_sweep.py --lengths ... --n 20 --warm 4` (20 rounds per
+length, first 4 discarded; 5 output tokens).
+
+### C.1 — 640 → 1536
+
+| input tokens | TTFT p50 (ms) | TTFT min (ms) |
+|---:|---:|---:|
+| 640   | 82.4  | 81.6  |
+| 768   | 82.3  | 81.5  |
+| 896   | 82.0  | 81.5  |
+| 960   | 83.0  | 82.0  |
+| 1,024 | 83.0  | 82.1  |
+| 1,152 | 100.7 | 98.6  |
+| 1,280 | 100.2 | 99.3  |
+| 1,408 | 104.7 | 103.5 |
+| 1,536 | 107.0 | 106.5 |
+
+### C.2 — 1664 → 2560
+
+| input tokens | TTFT p50 (ms) | TTFT min (ms) |
+|---:|---:|---:|
+| 1,664 | 160.9 | 158.5 |
+| 1,792 | 158.2 | 158.0 |
+| 1,920 | 159.2 | 158.2 |
+| 2,048 | 160.5 | 157.6 |
+| 2,176 | 101.8 | 101.3 |
+| 2,304 | 102.7 | 102.0 |
+| 2,432 | 108.5 | 105.6 |
+| 2,560 | 108.9 | 107.6 |
+
+### C.3 — 3584 → 4608
+
+| input tokens | TTFT p50 (ms) | TTFT min (ms) |
+|---:|---:|---:|
+| 3,584 | 111.7 | 110.7 |
+| 3,712 | 164.3 | 163.2 |
+| 3,840 | 165.7 | 163.3 |
+| 3,968 | 166.2 | 164.2 |
+| 4,096 | 165.4 | 164.4 |
+| 4,224 | 94.4  | 92.8  |
+| 4,352 | 108.3 | 107.7 |
+| 4,480 | 110.1 | 109.7 |
+| 4,608 | 113.5 | 113.0 |
+
+## D. Dense sweeps at concurrency 2
+
+Methodology as Section C, with `ttft_sweep.py --concurrency 2`: each round fires
+2 equal-length requests together via a thread pool, TTFT recorded per request
+(up to 20 rounds × 2 = 40 samples per length, first 4 rounds discarded). 0%
+prefix-cache hit verified.
+
+### D.1 — 1664 → 2560
+
+| input tokens | TTFT p50 (ms) | TTFT p90 (ms) | TTFT min (ms) |
+|---:|---:|---:|---:|
+| 1,664 | 241.1 | 247.9 | 235.8 |
+| 1,792 | 242.2 | 252.6 | 236.3 |
+| 1,920 | 243.2 | 251.0 | 236.8 |
+| 2,048 | 242.6 | 253.8 | 236.3 |
+| 2,176 | 184.2 | 192.0 | 178.1 |
+| 2,304 | 185.5 | 192.9 | 178.5 |
+| 2,432 | 185.3 | 192.1 | 177.7 |
+| 2,560 | 186.3 | 192.0 | 178.2 |
+
+### D.2 — 3584 → 4608
+
+| input tokens | TTFT p50 (ms) | TTFT p90 (ms) | TTFT min (ms) |
+|---:|---:|---:|---:|
+| 3,584 | 192.3 | 202.8 | 181.5 |
+| 3,712 | 252.1 | 262.6 | 240.3 |
+| 3,840 | 252.7 | 262.5 | 241.5 |
+| 3,968 | 252.0 | 259.5 | 242.2 |
+| 4,096 | 252.6 | 261.6 | 242.1 |
+| 4,224 | 179.7 | 190.9 | 171.4 |
+| 4,352 | 194.4 | 204.4 | 184.1 |
+| 4,480 | 194.7 | 201.2 | 184.6 |
+| 4,608 | 197.8 | 206.3 | 184.4 |

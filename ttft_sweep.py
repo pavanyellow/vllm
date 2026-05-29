@@ -1,31 +1,29 @@
 #!/usr/bin/env python3
-"""Single-stream TTFT vs. input-length sweep for a running vLLM server.
+"""TTFT vs. input-length sweep for a running vLLM server.
 
-Measures time-to-first-token (TTFT) at concurrency 1 across a range of input
-lengths, to probe where prefill moves from memory-bound (flat TTFT, dominated
-by the one-time weight read) to compute-bound (TTFT rising linearly with tokens).
+Measures time-to-first-token (TTFT) across a range of input lengths, to probe
+where prefill moves from memory-bound (flat TTFT, dominated by the one-time
+weight read) to compute-bound (TTFT rising linearly with tokens), and to expose
+shape-quantization (sawtooth) effects.
 
 Key properties:
   * Sends raw random token IDs via /v1/completions, so each prompt is unique
     => zero prefix-cache hits (we measure the warm compute path, not replays),
     and the exact input length is controlled with no tokenizer variance.
-  * One request in flight at a time (concurrency 1).
+  * --concurrency C fires C requests together (thread pool) and times each;
+    C=1 is the single-stream case.
   * TTFT = wall-clock from request send to the first streamed token chunk.
 
-Reports per length: median TTFT, min TTFT, and effective prefill throughput
-(input_len / TTFT). In the memory-bound region throughput rises with length;
-once compute-bound it plateaus.
-
 Usage:
-    # with the server already running on :8000
-    .venv/bin/python ttft_sweep.py                       # default 100..5000 sweep
-    .venv/bin/python ttft_sweep.py --lengths 256,2048,8192,16384,32000
+    .venv/bin/python ttft_sweep.py                       # default 100..5000, C=1
+    .venv/bin/python ttft_sweep.py --lengths 2048,4096,4224 --concurrency 2
     .venv/bin/python ttft_sweep.py --start 256 --stop 32000 --step 2048
 """
 
 import argparse
 import random
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import requests
 
@@ -58,10 +56,24 @@ def ttft_once(url: str, model: str, input_len: int, out_tokens: int) -> float:
     return time.perf_counter() - t0
 
 
-def median(xs):
+def percentile(xs, q):
     xs = sorted(xs)
-    n = len(xs)
-    return xs[n // 2] if n % 2 else (xs[n // 2 - 1] + xs[n // 2]) / 2
+    if not xs:
+        return float("nan")
+    i = min(len(xs) - 1, int(q * len(xs)))
+    return xs[i]
+
+
+def measure(url, model, length, out_tokens, rounds, warm, concurrency):
+    samples = []
+    with ThreadPoolExecutor(max_workers=concurrency) as ex:
+        for rnd in range(rounds):
+            futs = [ex.submit(ttft_once, url, model, length, out_tokens)
+                    for _ in range(concurrency)]
+            res = [f.result() for f in futs]
+            if rnd >= warm:
+                samples.extend(res)
+    return samples
 
 
 def parse_args():
@@ -74,8 +86,9 @@ def parse_args():
     p.add_argument("--start", type=int, default=None)
     p.add_argument("--stop", type=int, default=None)
     p.add_argument("--step", type=int, default=None)
-    p.add_argument("--n", type=int, default=12, help="requests per length")
-    p.add_argument("--warm", type=int, default=2, help="discarded warmup requests per length")
+    p.add_argument("--concurrency", type=int, default=1, help="requests in flight together")
+    p.add_argument("--n", type=int, default=12, help="rounds per length")
+    p.add_argument("--warm", type=int, default=2, help="discarded warmup rounds per length")
     p.add_argument("--out-tokens", type=int, default=5)
     return p.parse_args()
 
@@ -89,17 +102,15 @@ def main():
     else:
         lengths = DEFAULT_LENGTHS
 
-    print(f"{'in_len':>7} {'TTFT_p50_ms':>12} {'TTFT_min_ms':>12} {'prefill_tok/s':>14}")
+    print(f"concurrency={args.concurrency}")
+    print(f"{'in_len':>7} {'TTFT_p50_ms':>12} {'TTFT_p90_ms':>12} {'TTFT_min_ms':>12}")
     for length in lengths:
-        samples = []
-        for i in range(args.n):
-            t = ttft_once(args.url, args.model, length, args.out_tokens)
-            if i >= args.warm:
-                samples.append(t)
-        p50 = median(samples) * 1000.0
-        tmin = min(samples) * 1000.0
-        tput = length / (p50 / 1000.0)
-        print(f"{length:>7} {p50:>12.1f} {tmin:>12.1f} {tput:>14.0f}", flush=True)
+        s = measure(args.url, args.model, length, args.out_tokens,
+                    args.n, args.warm, args.concurrency)
+        p50 = percentile(s, 0.50) * 1000.0
+        p90 = percentile(s, 0.90) * 1000.0
+        tmin = min(s) * 1000.0
+        print(f"{length:>7} {p50:>12.1f} {p90:>12.1f} {tmin:>12.1f}", flush=True)
 
 
 if __name__ == "__main__":
