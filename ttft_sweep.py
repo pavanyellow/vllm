@@ -31,9 +31,30 @@ DEFAULT_LENGTHS = sorted(set(list(range(100, 5001, 300)) + [5000]))
 VOCAB_LO, VOCAB_HI = 100, 150_000   # safe non-special token-id range
 
 
-def ttft_once(url: str, model: str, input_len: int, out_tokens: int) -> float:
-    # fresh random token ids each call => unique prompt => no prefix-cache hit
-    prompt_ids = random.choices(range(VOCAB_LO, VOCAB_HI), k=input_len)
+def build_prefix(length: int, cache_frac: float) -> list:
+    # Deterministic shared prefix of round(cache_frac*length) tokens. Same tokens
+    # every call => identical block hashes => prefix-cache HIT once primed. The
+    # remaining suffix is fresh random per call => MISS (real prefill).
+    plen = int(round(length * cache_frac))
+    if plen <= 0:
+        return []
+    rng = random.Random(0xBEEF ^ length)   # stable across calls/runs for this length
+    return [rng.randrange(VOCAB_LO, VOCAB_HI) for _ in range(plen)]
+
+
+def prime(url: str, model: str, prefix: list) -> None:
+    # Send the prefix once so its blocks land in the prefix cache before timing.
+    if not prefix:
+        return
+    requests.post(url, json={"model": model, "prompt": prefix, "max_tokens": 1,
+                             "temperature": 0.0, "ignore_eos": True}).raise_for_status()
+
+
+def ttft_once(url: str, model: str, input_len: int, out_tokens: int,
+              prefix: list) -> float:
+    # prefix = cached portion (constant); suffix = fresh random => unique tail.
+    suffix = random.choices(range(VOCAB_LO, VOCAB_HI), k=input_len - len(prefix))
+    prompt_ids = prefix + suffix
     payload = {
         "model": model,
         "prompt": prompt_ids,
@@ -64,11 +85,13 @@ def percentile(xs, q):
     return xs[i]
 
 
-def measure(url, model, length, out_tokens, rounds, warm, concurrency):
+def measure(url, model, length, out_tokens, rounds, warm, concurrency, cache_frac):
+    prefix = build_prefix(length, cache_frac)
+    prime(url, model, prefix)   # cache the shared prefix before timing
     samples = []
     with ThreadPoolExecutor(max_workers=concurrency) as ex:
         for rnd in range(rounds):
-            futs = [ex.submit(ttft_once, url, model, length, out_tokens)
+            futs = [ex.submit(ttft_once, url, model, length, out_tokens, prefix)
                     for _ in range(concurrency)]
             res = [f.result() for f in futs]
             if rnd >= warm:
@@ -90,6 +113,9 @@ def parse_args():
     p.add_argument("--n", type=int, default=12, help="rounds per length")
     p.add_argument("--warm", type=int, default=2, help="discarded warmup rounds per length")
     p.add_argument("--out-tokens", type=int, default=5)
+    p.add_argument("--cache-frac", type=float, default=0.0,
+                   help="fraction of each prompt that is a primed, cached shared "
+                        "prefix (0.0 = clean baseline, no cache hit)")
     return p.parse_args()
 
 
@@ -102,11 +128,11 @@ def main():
     else:
         lengths = DEFAULT_LENGTHS
 
-    print(f"concurrency={args.concurrency}")
+    print(f"concurrency={args.concurrency} cache_frac={args.cache_frac}")
     print(f"{'in_len':>7} {'TTFT_p50_ms':>12} {'TTFT_p90_ms':>12} {'TTFT_min_ms':>12}")
     for length in lengths:
         s = measure(args.url, args.model, length, args.out_tokens,
-                    args.n, args.warm, args.concurrency)
+                    args.n, args.warm, args.concurrency, args.cache_frac)
         p50 = percentile(s, 0.50) * 1000.0
         p90 = percentile(s, 0.90) * 1000.0
         tmin = min(s) * 1000.0
