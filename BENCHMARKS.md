@@ -138,3 +138,31 @@ prefix-cache hit verified.
 | 4,352 | 194.4 | 204.4 | 184.1 |
 | 4,480 | 194.7 | 201.2 | 184.6 |
 | 4,608 | 197.8 | 206.3 | 184.4 |
+
+## E. Pad-past-boundary test (concurrency 1)
+
+Methodology as Section C (concurrency 1, unique random token-id prompts, 0%
+prefix-cache hit, `ttft_sweep.py --lengths ... --n 20 --warm 4`). Brackets the
+6144 and 8192 token boundaries to measure TTFT just below vs just above.
+
+| input tokens | TTFT p50 (ms) | TTFT p90 (ms) | TTFT min (ms) |
+|---:|---:|---:|---:|
+| 6,016 | 169.2 | 172.2 | 168.7 |
+| 6,144 | 170.4 | 185.9 | 167.9 |
+| 6,272 | 172.1 | 181.2 | 170.2 |
+| 6,400 | 141.6 | 155.0 | 139.2 |
+| 8,064 | 177.1 | 189.0 | 175.9 |
+| 8,192 | 177.9 | 186.6 | 175.9 |
+| 8,320 | 179.0 | 193.1 | 176.8 |
+| 8,448 | 182.0 | 203.0 | 178.9 |
+| 8,704 | 205.1 | 215.0 | 195.9 |
+
+TTFT at each 2048-multiple boundary vs. the same prompt padded past it
+(concurrency 1, p50; boundary rows from Sections C.2/C.3 and E):
+
+| boundary | TTFT on boundary (ms) | padded length | TTFT padded (ms) | change |
+|---:|---:|---:|---:|---:|
+| 2,048 | 160.5 | 2,176 | 101.8 | −37% |
+| 4,096 | 165.4 | 4,224 | 94.4  | −43% |
+| 6,144 | 170.4 | 6,400 | 141.6 | −17% |
+| 8,192 | 177.9 | 8,320 | 179.0 | +1% |
