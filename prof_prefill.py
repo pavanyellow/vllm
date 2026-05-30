@@ -33,16 +33,18 @@ import requests
 VOCAB_LO, VOCAB_HI = 100, 150_000
 
 # Buckets: (label, regex over kernel name, case-insensitive). First match wins,
-# so order matters (most specific first). Anything unmatched -> OTHER, and is
-# printed individually so the bucket set can be refined from real names.
+# so order is most-specific -> generic. The gated-deltanet (DeltaRule) and
+# FlashAttn kernels are both wrapped in `cutlass::device_kernel<...>`, so the
+# generic gemm/cutlass rule MUST come last or it would steal them.
+# Anything unmatched -> OTHER, printed individually so buckets can be refined.
 BUCKETS = [
-    ("fp8_dynamic_quant",   r"quant|scaled_fp8|per_token.*scale|dynamic.*scale|act.*quant"),
-    ("moe_grouped_gemm",    r"grouped|m_grouped|masked.*gemm|moe.*gemm"),
-    ("dense_gemm",          r"fp8_gemm|gemm|cutlass|s\d+_.*gemm|matmul|nvjet"),
-    ("lin_attn_gdn",        r"chunk|delta|gdn|kkt|recurr|conv1d|causal_conv|scan|wy|merge|recompute|fused_(chunk|recurrent)"),
-    ("full_attn_fmha",      r"fmha|flash|mha|attention|attn|fa[23]"),
-    ("moe_route_act",       r"topk|moe_align|moe_sum|argsort|\bsort\b|scatter|gather|index_|permute|silu|act_and_mul|finalize|expert"),
-    ("elementwise_norm",    r"rms_?norm|layernorm|norm|elementwise|vectorized|add|copy|cast|fill|memcpy|memset|reduce|rope|rotary|embed"),
+    ("lin_attn_gdn",        r"deltarule|delta_rule|causal_conv|conv1d|post_conv|fused_recurrent|fused_chunk|chunk_scan|chunk_o|\bgdn\b|\bwy\b"),
+    ("full_attn_fmha",      r"flashattn|flash::|flash_fwd|fmha"),
+    ("fp8_dynamic_quant",   r"quant"),
+    ("moe_grouped_gemm",    r"fused_moe|grouped_gemm|m_grouped|moe_gemm"),
+    ("moe_route_act",       r"topkgating|topk|moe_align|moe_sum|count_and_sort|expert_token|act_and_mul|finalize|scatter|permute"),
+    ("elementwise_norm",    r"rms_norm|layernorm|\bnorm\b|elementwise|vectorized|reduce_kernel|rsqrt|mean_mul_pow|memcpy|memset|reshape_and_cache|index_|fill|exp_kernel|sigmoid|bitwise|to_copy|copy|\badd\b|silu|\bmul\b"),
+    ("dense_gemm",          r"sm90_fp8_gemm|deep_gemm|fp8_gemm|nvjet|cutlass|\bgemm\b|matmul"),
 ]
 
 
