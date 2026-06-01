@@ -64,6 +64,8 @@ under real load (open TODO). To revert: drop `--block-size`/`--max-num-seqs`.
 - `daylog/2026-05-29.md` — B200 183GB (E1–E7): TTFT sweep, prefix cache, prefill
   scaling, roofline, kernel attribution. Separate hardware reference.
 - `daylog/2026-05-30-h100.md` — H100 80GB (E8–E12): this run.
+- `daylog/2026-06-01-h100-repro.md` — H100 80GB: independent replication of E9
+  (block=8192 flat band / no sawtooth) on a second box. Reproduced.
 - `ttft_sweep.py` — TTFT vs input-length sweep (raw token-ids, `--cache-frac`).
 - `prof_prefill.py` — drive torch profiler around one prefill, bucket device-kernel
   time by component.
