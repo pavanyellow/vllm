@@ -95,6 +95,39 @@ second bandwidth+compute pass, with no exposed dispatch — graphs are structura
 it. Killing it still needs 1-pass (block=8192), which still kills caching — same catch-22 as H100,
 now at ~30% lower absolute latency.
 
+### Warm cache-hit reprefill, profiled (4000 ctx, last 200 changed, 79% hit)
+The warm path recomputes the trailing partial block — block-granular reuse caches 3168 tok,
+recomputes the **832-tok tail** (one ≤1056 chunk, graphed). `prof_warm.py`: **20.1 ms GPU-busy,
+1734 kernels** (TTFT 27 ms ⇒ ~7 ms fixed host overhead):
+
+| Component | ms | % | bound by |
+|---|--:|--:|---|
+| MoE expert GEMM (`bmm_*dsFp8`, ×40) | 6.3 | 31% | **bandwidth** (still reads ~all 32 GB experts) |
+| Quant + norm + route | ~5.5 | 27% | overhead |
+| Dense GEMMs | 4.25 | 21% | mixed |
+| Gated-deltanet scan | ~3.3 | 16% | compute |
+| Full attention | 0.5 | 2.5% | — |
+
+The warm tail is *more* bandwidth-bound than cold (31% vs 25%): 832 tokens still activate ~all
+256 experts, so you pay nearly the full 32 GB weight read for 5× fewer tokens — the MoE GEMM
+only halves (13 → 6.3 ms) for a 5× token cut. So even at warm-28 ms, ~⅓ is the expert read.
+
+### 4-GPU projection (TP=4) — reasoned from the kernel split, not measured (we have 1 B200)
+At C=1 this is a *latency* workload, not throughput. TP=4 shards only the parts that are
+compute/BW-bound and adds an all-reduce per attention + per MoE layer (~80 syncs/pass):
+- **Shrinks ~4×:** MoE expert read (13→~3–4 ms, per-GPU reads 8 GB), dense GEMMs (12.6→~3–4 ms).
+- **Shrinks poorly:** deltanet scan (already small kernels; sharding 32→8 heads makes them more
+  launch-bound), quant/norm/route (~replicated/per-token fixed), and the ~7–9 ms host overhead.
+- **Adds:** ~80 NVLink all-reduces/pass (latency, not bandwidth, bound at C=1).
+
+Net projection: cold 4k ~71 → **~45 ms**, warm ~28 → **~22 ms** — a real but **sublinear ~1.4×**,
+not 4×, because ~⅓–½ of the time (deltanet + overhead + new comms) doesn't shard. **4×B200 > 4×H100**
+on absolute latency (NVLink + compute + per-GPU BW), but the model is 33 GB and fits on *one* GPU,
+so TP=4 spends 4× hardware for ~1.4× latency. For throughput, **4 single-GPU replicas** dominates
+TP (4× capacity, zero comm). TP=4 is only worth it if sub-45 ms cold TTFT is a hard product
+requirement; otherwise replicas. (4×H100-TP would mainly help by sharding the 23 ms weight-read
+that was H100's single-GPU wall — closing most of its gap to a single B200.)
+
 ### Shippable B200 config (validated)
 `block=1056 + graphs→4224 + prefix caching` (util 0.85), the G6 command with the ladder extended
 to `…,1152,1200,2112,3168,4224`:
