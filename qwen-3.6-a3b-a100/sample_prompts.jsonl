@@ -1,0 +1,6 @@
+{"prompt": "What is the capital of France?"}
+{"prompt": "Write a one-sentence summary of the theory of relativity."}
+{"prompt": "Explain how transformer attention works."}
+{"messages": [{"role": "system", "content": "You are a helpful voice assistant. Keep responses concise."}, {"role": "user", "content": "Set a timer for 5 minutes"}]}
+{"messages": [{"role": "user", "content": "Translate to Spanish: 'Where is the train station?'"}]}
+{"prompt": "Q: 2+2*3 = ?\nA:"}
