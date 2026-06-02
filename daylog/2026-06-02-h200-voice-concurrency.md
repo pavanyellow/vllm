@@ -139,6 +139,50 @@ unique-context prefills colliding) *before* the slot count saturates. For a voic
 SLO of p99 ≤ ~250 ms, that's ~**200 concurrent active calls per H200**; raw
 throughput could go several-fold higher with a looser SLO or backfill traffic.
 
+## V5 — past the knee: the saturation cliff, and why bigger queues don't help
+
+Pushing the mix to 500 calls (`--max-num-seqs 32 --max-num-batched-tokens 8192`):
+
+| | 100 | 200 | 500 |
+|---|---:|---:|---:|
+| throughput | 6.8 req/s | 13.1 | 29.1 |
+| TTFT p50 | 42.4 | 48.9 | 349.8 |
+| TTFT p99 | 82.0 | 233.6 | 6,188 |
+| peak in-flight | 9 | 20 | 206 |
+| avg in-flight | 1.20 | 3.49 | 52.96 |
+
+500 calls offer ~170k tok/s vs the GPU's ~120k tok/s prefill ceiling → unbounded
+queue, p99 = **6.2 s**. The avg-in-flight jump (3.5→53) is **Little's Law**
+(`in-flight = throughput × latency`): throughput ×2.2 (13→29 req/s) and per-request
+latency ×6.9 (~0.26→~1.8 s, mostly queue wait) multiply to ×15. Peak 206 =
+~32 running + ~174 queued. Below capacity requests pass through (in-flight ∝ calls);
+above it they stack up (in-flight = queue depth).
+
+**Do more slots / a bigger batch budget move the wall?** Re-ran with both doubled
+(`--max-num-seqs 64 --max-num-batched-tokens 16384`):
+
+| | 200 (32/8192) | 200 (64/16384) | 500 (32/8192) | 500 (64/16384) |
+|---|---:|---:|---:|---:|
+| throughput | 13.1 req/s | 13.1 | 29.1 | 29.6 |
+| TTFT p50 | 48.9 | 50.6 | 349.8 | 159.4 |
+| TTFT p90 | 107.3 | 106.5 | 3,875 | 2,159 |
+| TTFT p99 | 233.6 | **686.4** | 6,188 | 3,479 |
+| TTFT max | 283.1 | 1,167.9 | 6,461 | 3,724 |
+
+- **Throughput ceiling unchanged** (29.1→29.6 req/s, ~120k tok/s). Prefill is
+  **compute/bandwidth-bound on the 32 GB MoE weight read**, NOT gated by
+  `max-num-batched-tokens`. The ~350-call wall doesn't move.
+- **At 500** (over capacity) latency ~halved (p99 6.2→3.5 s) — bigger steps drain the
+  backlog more efficiently — but still multi-second, still unusable.
+- **At 200** (the SLO knee) p99 got **worse** (234→686 ms): the 16k budget packs ~4
+  concurrent 4k prefills into one step, so a request sharing that megabatch waits
+  longer for its first token → fatter tail. **Net negative at the voice operating point.**
+
+**Takeaway:** for the voice SLO keep `--max-num-seqs 32 --max-num-batched-tokens 8192`
+(tighter p99 at the knee). Doubling only helps over-capacity batch-style traffic, and
+never raises the throughput ceiling. Capacity grows only via **smaller context, more
+prompt sharing, or more GPUs** — not bigger queues.
+
 ## Capacity & economics (per H200, $5/hr, ~6-turn ~1-min calls, 4k ctx)
 
 Steady-state at the knee:
