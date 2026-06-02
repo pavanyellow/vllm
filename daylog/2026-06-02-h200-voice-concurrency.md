@@ -29,6 +29,33 @@ vllm serve Qwen/Qwen3.6-35B-A3B-FP8 --served-model-name Qwen/Qwen3.6-35B-A3B \
   --compilation-config '{"cudagraph_capture_sizes":[1,2,4,8,16,24,32,40,48,56,64,72,80,88,96,104,128,256,384,512,640,768,896,1024,1152,1200,2112,3168,4224]}'
 ```
 
+## Server stats / observability
+
+vLLM exposes a Prometheus `/metrics` endpoint (unauthenticated; open here — would be
+firewalled in a locked-down customer deployment). Two scrapes used throughout:
+
+**Cumulative tokens processed** (counters; reset per server instance):
+```bash
+curl -s http://127.0.0.1:8080/metrics | grep -E "^vllm:(prompt|generation)_tokens_total"
+# vllm:prompt_tokens_total{...}     1.6316669e+07
+# vllm:generation_tokens_total{...} 150806.0
+```
+
+**Live load snapshot** (running vs queued, KV pressure, cache hit rate):
+```bash
+curl -s http://127.0.0.1:8080/metrics | grep -E \
+  "^vllm:(num_requests_running|num_requests_waiting|gpu_cache_usage_perc|prefix_cache_(hits|queries)_total)"
+```
+
+`num_requests_waiting` is the queue depth — the saturation tell: ~0 below the wall,
+climbing once offered load exceeds the ~120k tok/s prefill ceiling (V5). The engine
+also logs a periodic line with the same fields:
+```bash
+grep "Avg prompt throughput" vllm-8080.log | tail -1
+# Avg prompt throughput: X tok/s, Avg generation throughput: Y tok/s,
+# Running: R reqs, Waiting: W reqs, GPU KV cache usage: Z%, Prefix cache hit rate: P%
+```
+
 ## V0 — G7 validated on H200: big-chunk graphs collapse the cold 3k–5k plateau
 
 `ttft_sweep.py` (clean, `cache_frac=0`), captures ≤1200 vs captures + {2112,3168,4224}:
