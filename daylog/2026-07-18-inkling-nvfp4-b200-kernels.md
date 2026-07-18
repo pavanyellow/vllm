@@ -124,3 +124,30 @@ Box: 4× B200 183 GiB, vLLM 0.1.dev18898+g93d5b2187 (inkling), NVFP4, TP=4 + EP,
 --enforce-eager. Nsight Systems 2024.6.2, cudaProfilerApi capture range.
 Scripts: prof_prefill.py, parse_trace.py, launch_nsys.sh.
 ```
+
+## Addendum — where the ~36k tok/s prefill ceiling comes from (saturated nsys, C=32)
+Repeated the cudaProfilerApi capture under **saturated load**: 32 concurrent cold
+4096-tok prefills inside the window (32×4096 in 3.94 s = 33.2k tok/s eager;
+graphed config measures ~36.4k). Report: `prefill_c32.nsys-rep` method as before.
+
+Per-GPU busy: **GPUs 0–2 = 99.5%**, GPU 3 = 74.7% (45.5k launches each). Bucket
+shares of total GPU time (agg 4 GPUs, 14.6 s):
+```
+attention machinery (sconv/publish/FA4)   27.9%
+MoE (FP4 experts + route)                 26.6%
+TP sync (_reduce_insert)                  22.6%   <- ~20% of node time is spin-wait
+dense GEMM                                20.8%
+glue/other                                 2.1%
+comm (NCCL allreduce/allgather)            0.1%   <- 9 ms total. NOT the ceiling.
+```
+Findings:
+1. **Not inter-GPU bandwidth**: real NCCL work is 0.1%. The TP collective cost lives
+   in `_reduce_insert` and is *synchronization*, not data volume.
+2. **~77% is raw forward compute**, split ~evenly across the three compute buckets.
+   Per-token compute is flat vs load (**22.4 µs/tok/GPU @C=32 vs 23.4 @C=1**) — pure
+   compute-bound. Sync-free ideal ≈ **45k tok/s**.
+3. **~20% is recoverable**: the C=1 rank asymmetry persists at saturation — one rank
+   (gpu3 here) runs ~1 s less busy with real gaps while the other three spin it away
+   in `_reduce_insert`. Fixing that imbalance is worth ~33→45k tok/s; beyond that the
+   ceiling only moves by making the model's kernels faster (sconv/publish fusion is
+   the most Inkling-specific target).
