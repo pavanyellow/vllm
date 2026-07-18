@@ -170,13 +170,43 @@ Server: S32 + 512 GiB KV offload + 6144 graphs. 120 s per level:
   ~2× more with a looser SLO. Tool calls ≈ 1.4× the LLM requests per turn (llm_reqs vs
   turns), already included.
 
+## V6 — capacity-lever A/Bs: three honest negatives + a corrected ceiling
+Tested the remaining server-side levers for moving the ~500-line knee. All dead ends,
+each for an instructive reason:
+
+- **`--kv-cache-dtype fp8`: incompatible AND pointless.** Worker crashes in warmup
+  (`AssertionError: inputs must have the same dtype` — the FA4/sconv path requires
+  bf16 KV). And capacity only went 38,868 → 42,861 tokens (**+10%, not 2×**): most of
+  Inkling's ~0.62 MB/tok/GPU KV is **sconv/hybrid state, not quantizable attention
+  K/V**. Even a working fp8-KV wouldn't fix retention.
+- **`gpu-memory-utilization` 0.90→0.95: dropped.** Real memory split is weights
+  137.5 GiB (77%) / KV 24 GiB (13.5%) / graphs ~4 / slack ~10. Active KV peaked at
+  **11%** during the prod runs, and retention is already backstopped by the 512 GiB
+  CPU offload tier. More GPU KV moves nothing.
+- **FlashInfer autotune ON: null.** Identical cold-prefill probe (C=8/16/32 × 4.3k
+  cold, gen=8), same config otherwise:
+  ```
+   C   OFF ttft_p50/wall    ON ttft_p50/wall
+   8      472 / 4.38s          537 / 4.41s
+  16      685 / 4.04s          683 / 3.90s
+  32     1729 / 3.84s         1725 / 3.83s
+  ```
+  Within noise everywhere — heuristic kernel configs were already optimal for these
+  shapes. Keep autotune off (saves ~3 min startup).
+- **Corrected ceiling:** the same probe pins saturated cold prefill at **~36k tok/s**
+  (139k tok / 3.83 s at C=32) — higher than the ~24–28k inferred from the voice-run
+  engine logs (those were 10 s averages with decode interleaved). Implication: the
+  voice knee is **burst collisions + decode interference**, not the raw prefill
+  ceiling — so the best remaining levers are client-side (**dial pacing** to smooth
+  cold-prefill collisions, smaller caller records) and model-side (attention-plumbing
+  fusion; MTP would cut the ~300 ms decode component of TTFS if ever in scope).
+
 ## Open / next
-- Re-run V3 at 200 on server **U** (uncapped) to separate queue-wait (from `max_num_seqs
-  32`) from true compute saturation.
-- Scheduler sweep: `--max-num-seqs {8,16,32,64}` p99 at the knee (qwen found tighter =
-  better tail).
-- Fill the 500–1000 gap (750 dialed) to pin the SLO crossing; longer runs (10 min) for
-  steady-state cache churn.
+- **Dial pacing A/B** (client-side, free): cap concurrent first-turn prefills / jitter
+  connects; expected to push the knee toward the ~36k ceiling.
+- Re-run V3 at 200 on server **U** (uncapped) to separate queue-wait from compute.
+- Scheduler sweep: `--max-num-seqs {8,16,32,64}` p99 at the knee.
+- Fill the 500–1000 gap (750 dialed); longer runs (10 min) for steady-state churn.
 
 ```
 Box: 4× B200 183 GiB, vLLM 0.1.dev18898+g93d5b2187 (inkling), NVFP4, TP=4 + EP,
