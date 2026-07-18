@@ -138,15 +138,45 @@ call's blocks during its 8–16 s gap, so nothing is ever read back.
   inter-turn gap: ≈ contexts × ctx_tokens × KV-bytes/token, with ~10× headroom vs the
   naive estimate (observed churn). Host RAM here is 1.7 TB — 512 GiB is cheap.
 
+## V5 — production-faithful outbound sim (`voice_sim_prod.py`)
+The earlier sim was too easy in places (immortal calls = no churn, no tool calls, no
+barge-in) and too harsh in others (all-unique 4k contexts, every call always active).
+New driver models an **outbound dialer**: N lines looping dial(ring 5–15 s) → **10%
+connect** (standard outbound) → ~6-turn conversation → hangup → redial with a **new
+caller**. Context = **shared 3k tenant prompt + unique 400-tok caller record** per
+connect (steady cold-prefill arrival from churn). **Tool turns p=0.5** (two LLM
+round-trips with a 200-tok tool result injected), **barge-in p=0.15** (stream cancelled
+after a few tokens), **history grows** turn-over-turn, thinking off. Reports TTFT and
+**TTFS** (time-to-first-sentence ≈ 25 tok — what the caller actually hears).
+
+Server: S32 + 512 GiB KV offload + 6144 graphs. 120 s per level:
+
+| dialed | ~active convos | TTFT p50/p99 | TTFS p50/p99 | hit | computed prefill | avg/peak inflight |
+|--:|--:|--:|--:|--:|--:|--:|
+| 500  | ~50  | 71 / 124 ms  | 363 / 529 ms   | 95.9% | 2,683 tok/s  | 6.5 / 24 |
+| 1000 | ~100 | 138 / 590 ms | 593 / 1,142 ms | 87.4% | 15,834 tok/s | 21.3 / 64 |
+| 2000 | ~200 | 11,377 / 18,904 ms | 12,142 / 19,585 ms | 67.7% | 52,164 tok/s | 395 / 902 |
+
+- **dialed=500 (~50 live conversations) is the healthy operating point** — p99 TTFT
+  124 ms, TTFS p99 529 ms, prefill 2.7k tok/s, GPU mostly idle.
+- **The knee is between 500 and 1000**: at 1000 the hit rate slips (record churn +
+  tool-result injections outpace cache), computed prefill jumps 6× toward the ~25k
+  ceiling, TTFS p99 crosses 1 s.
+- **2000 is a cliff**: offered prefill 52k tok/s ≈ 2× sustainable → unbounded queue,
+  11 s median TTFT, 902 in flight. Same Little's-Law blowup as V1, now with realistic
+  traffic shape.
+- Capacity claim for this model/node with production traffic: **~500 dialed lines
+  (~50 concurrent conversations) per 4×B200 node** at a voice SLO (TTFS p99 ≤ ~600 ms);
+  ~2× more with a looser SLO. Tool calls ≈ 1.4× the LLM requests per turn (llm_reqs vs
+  turns), already included.
+
 ## Open / next
 - Re-run V3 at 200 on server **U** (uncapped) to separate queue-wait (from `max_num_seqs
   32`) from true compute saturation.
 - Scheduler sweep: `--max-num-seqs {8,16,32,64}` p99 at the knee (qwen found tighter =
   better tail).
-- Production-faithful sim (`voice_sim_prod.py`): outbound dialer, **10% connect rate**,
-  call churn (~6-turn calls, fresh caller record each connect), shared 3k tenant prompt
-  + 400-tok unique record, tool turns (2 round-trips + 200-tok result, p=0.5),
-  barge-in (p=0.15), growing history, TTFS metric. Built; first run pending.
+- Fill the 500–1000 gap (750 dialed) to pin the SLO crossing; longer runs (10 min) for
+  steady-state cache churn.
 
 ```
 Box: 4× B200 183 GiB, vLLM 0.1.dev18898+g93d5b2187 (inkling), NVFP4, TP=4 + EP,
