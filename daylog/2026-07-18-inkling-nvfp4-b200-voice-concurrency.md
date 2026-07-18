@@ -103,13 +103,50 @@ only *isolates* tenants). Options, best first:
 3. **Route through shared prefixes** — genuinely shared blocks stay hot via LRU for free
    (V2 all-shared). No pin needed.
 
+## V4 — KV offloading A/B: buffer size is everything (128 GiB fails, 512 GiB works)
+Relaunched with `--kv-offloading-size {128,512} --kv-offloading-backend native` (+ the
+tuned 6144 graph ladder), same S32 scheduler. vLLM logs `CPUOffloadingSpec`; transfer
+counters via `/metrics` `vllm:kv_offload_total_bytes_total{transfer_type}`.
+
+**128 GiB: write-only, useless.** All-unique 100 calls: hit rate still **0.0%**,
+recompute 22,341 tok/s, TTFT p50 284 ms. Counters: **GPU→CPU 1.3 TB, CPU→GPU 0 bytes**
+— 1.3 TB spilled into a 128 GiB buffer = ~10× wrap; the CPU tier itself LRU-evicts a
+call's blocks during its 8–16 s gap, so nothing is ever read back.
+
+**512 GiB: read-back turns on and the wall moves.** `CPU_to_GPU` went 0 → **33.8 GB**:
+
+| arm (100 calls, ctx 3–5k) | hit rate | computed prefill | TTFT p50/p99 | avg inflight |
+|---|--:|--:|--:|--:|
+| all-unique, no offload (V2)     | 0.0%  | 19,994 tok/s | 343 / 822 ms | 9.46 |
+| all-unique, offload **128 GiB** | 0.0%  | 22,341 tok/s | 284 / 672 ms | 8.48 |
+| all-unique, offload **512 GiB** | **60.5%** | **9,570 tok/s** | **44 / 434 ms** | **2.83** |
+| groups 30,30, no offload (V2)   | 88.8% | 2,747 tok/s  | 40 / 312 ms  | 2.17 |
+| groups 30,30, offload **512 GiB** | **99.2%** | **206 tok/s** | **37 / 60 ms** | **1.61** |
+| shared+256-fresh, offload 512   | 93.3% | 1,747 tok/s  | 56 / 143 ms  | 2.55 |
+
+- Cleanest same-ladder pair (all-unique, 128 vs 512 GiB): **TTFT p50 284 → 44 ms
+  (6.5×)**, recompute halved, in-flight 3× lower.
+- **Groups 30,30 (the production-like mix): p99 312 → 60 ms and recompute 2,747 → 206
+  tok/s (13×)** — the 40% unique callers now reload from CPU instead of recomputing.
+  For this workload, a big-enough CPU spill buffer effectively *solves* the KV wall.
+- Shared+256-fresh: unchanged caching (93.3% both ways — the fresh 256 are genuinely
+  new; CPU→GPU stayed flat during this arm since the shared block never leaves GPU).
+- Caveat: V2 baselines ran on the default ≤512 graph ladder, offload arms on the 6144
+  ladder — hit-rate/recompute comparisons are ladder-independent; TTFT deltas vs V2
+  are partly graphs. The 128-vs-512 pair is confound-free.
+- Sizing rule: buffer must hold **all live distinct contexts** for at least one
+  inter-turn gap: ≈ contexts × ctx_tokens × KV-bytes/token, with ~10× headroom vs the
+  naive estimate (observed churn). Host RAM here is 1.7 TB — 512 GiB is cheap.
+
 ## Open / next
-- `--kv-offloading-size 200` A/B on the all-unique case: expect 0% → high effective hit,
-  20k → low tok/s recompute, TTFT drop.
 - Re-run V3 at 200 on server **U** (uncapped) to separate queue-wait (from `max_num_seqs
   32`) from true compute saturation.
 - Scheduler sweep: `--max-num-seqs {8,16,32,64}` p99 at the knee (qwen found tighter =
   better tail).
+- Production-faithful sim (`voice_sim_prod.py`): outbound dialer, **10% connect rate**,
+  call churn (~6-turn calls, fresh caller record each connect), shared 3k tenant prompt
+  + 400-tok unique record, tool turns (2 round-trips + 200-tok result, p=0.5),
+  barge-in (p=0.15), growing history, TTFS metric. Built; first run pending.
 
 ```
 Box: 4× B200 183 GiB, vLLM 0.1.dev18898+g93d5b2187 (inkling), NVFP4, TP=4 + EP,
