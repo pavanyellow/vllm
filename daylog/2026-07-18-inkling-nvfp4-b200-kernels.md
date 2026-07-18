@@ -1,121 +1,126 @@
-# 2026-07-18 Day Log — Inkling-NVFP4 on 4× B200: C=1 kernel map
+# 2026-07-18 Day Log — Inkling-NVFP4 on 4× B200: C=1 kernel map (Nsight-calibrated)
 
 Going into the kernels. Where does GPU time actually go for a single-stream (C=1)
-prefill? Torch-profiler traces, per-rank, leaf GPU kernels only. Companion to the
+prefill? First pass with the torch profiler (proportions only — its async-engine
+capture window mangled absolute numbers), then **Nsight Systems with a
+`cudaProfilerApi` capture range** for calibrated per-kernel durations. Companion to the
 prefill/TTFT daylog (`2026-07-18-inkling-nvfp4-b200x4.md`).
 
-**Headline:** at C=1 the forward is ~half idle — 3 of 4 TP ranks park ~half the window
-in a single cross-rank sync kernel (`_reduce_insert_kernel`), and rank0 shows the same
-idle as inter-kernel launch gaps. Of the *compute* that does run, it splits roughly
-**MoE FP4 experts ≈ 37% / attention machinery ≈ 35% / dense GEMM ≈ 25%** — and the
-"attention" share is dominated by Inkling's custom **sconv + relative-pos + sink**
-plumbing, *not* the FlashAttention-4 math (which is only ~7 ms of it).
+**Headline (nsys, L=4096, eager):** ~**96 ms of real GPU compute per prefill, identical
+across all 4 TP ranks**, split **MoE FP4 experts 37.5% / attention machinery 34.6% /
+dense GEMM 23.7% / glue 4%**. But the forward is **~44% idle** — every rank spends
+~74 ms not computing (launch gaps + a cross-rank sync); on 3 of 4 ranks that idle is
+absorbed into a single spin-waiting kernel, `_reduce_insert_kernel` (65–77 ms), while
+the lead rank shows it as gaps. The attention share is dominated by Inkling's custom
+**sconv + relative-pos + sink** plumbing, *not* the FlashAttention-4 math (~7 ms of it).
 
-## Profiling setup
-Dedicated server, **`--enforce-eager`** (clean per-kernel attribution, no graph-replay
-opacity) + torch profiler:
-```bash
-vllm serve thinkingmachines/Inkling-NVFP4 \
-  --trust-remote-code --tokenizer-mode inkling --reasoning-parser inkling \
-  --tool-call-parser inkling --enable-auto-tool-choice \
-  --tensor-parallel-size 4 --kernel-config.enable_flashinfer_autotune=False \
-  --max-model-len 8192 --kv-cache-memory=8589934592 --enforce-eager \
-  --profiler-config.profiler=torch \
-  --profiler-config.torch_profiler_dir=/workspace/prof \
-  --profiler-config.torch_profiler_record_shapes=true \
-  --profiler-config.torch_profiler_with_flops=true \
-  --profiler-config.torch_profiler_with_stack=false \
-  --host 0.0.0.0 --port 8000
-```
-Driver (`prof_prefill.py`): 5 warm prefills → `POST /start_profile` → **1 prefill**
-(random token-ids, `max_tokens=1`) → `POST /stop_profile`. Parser (`parse_trace.py`)
-sums `cat=="kernel"` device events per name and buckets by an Inkling-aware classifier.
-Traces are per rank: `dp0_pp0_tp{r}_..._rank{r}.pt.trace.json.gz`.
+## Method
+Dedicated server, `--enforce-eager` (clean per-kernel attribution, no graph replay).
+Two profilers:
 
-## Finding 1 — C=1 is ~50% idle, and the idle hides in one sync kernel
-L=4096 prefill, busy (Σ kernel dur) vs wall-span, per rank:
-```
- rank    busy     span   idle    note
-   0     98.6    196.2   97.6    idle shows as inter-kernel GAPS (50% busy)
-   1    191.5    195.5    4.0    idle ABSORBED into _reduce_insert_kernel (96.3 ms)
-   2    191.8    ~195     ~4     _reduce_insert = 97.0 ms
-   3    191.6    ~195     ~4     _reduce_insert = 96.2 ms
-```
-`_reduce_insert_kernel` is **2.7 ms on rank0 but ~96 ms on ranks 1–3** — a cross-rank
-sync point where three ranks spin-wait. Both views agree: **all ranks span ~196 ms
-wall, of which only ~99 ms is real compute; ~97 ms (~50%) is idle** (launch gaps +
-TP sync bubble). This is the textbook C=1 signature — latency/launch/sync-bound, not
-compute-bound — and it's *why* the two big wins in the prefill daylog worked: FULL
-CUDA-graphs (T4) remove the launch-gap half, and batching (T3/EC3) fills the bubble.
-(Root cause of the rank0-vs-rest imbalance at the reduce/insert step — root-heavy
-reduction vs rank0 doing extra serial routing work — needs deeper tracing.)
+1. **torch** (`--profiler-config.profiler=torch …`) via `/start_profile`+`/stop_profile`
+   — good for kernel *identity* and *proportions*, but the async engine loop +
+   `active_iterations=5` schedule made absolute/scaling numbers unreliable (a 2048 vs
+   4096 capture gave a non-physical 6.5× gap). Use for names, not magnitudes.
+2. **Nsight Systems** (authoritative magnitudes) — server run under nsys with capture
+   keyed to `cudaProfilerStart` (vLLM `profiler=cuda` mode calls it on `/start_profile`),
+   so nsys records *only* the single profiled prefill:
+   ```bash
+   nsys profile --capture-range=cudaProfilerApi --capture-range-end=stop-shutdown \
+     --trace=cuda,nvtx --cuda-graph-trace=node --sample=none -o /workspace/nsys/prefill4096 \
+     vllm serve thinkingmachines/Inkling-NVFP4 --trust-remote-code --tokenizer-mode inkling \
+       --reasoning-parser inkling --tool-call-parser inkling --enable-auto-tool-choice \
+       --tensor-parallel-size 4 --kernel-config.enable_flashinfer_autotune=False \
+       --max-model-len 8192 --kv-cache-memory=8589934592 --enforce-eager \
+       --profiler-config.profiler=cuda --host 0.0.0.0 --port 8000
+   # driver: 5 warm prefills -> POST /start_profile -> 1 prefill (4096 rand ids, max_tokens=1) -> POST /stop_profile
+   nsys stats --report cuda_gpu_kern_sum prefill4096.nsys-rep      # per-kernel GPU time
+   # + per-GPU split via the .sqlite (CUPTI_ACTIVITY_KIND_KERNEL x StringIds)
+   ```
+   The `.nsys-rep` is only 709 KB — capture-range excluded all startup.
 
-## Finding 2 — the compute map (rank0, L=4096, the un-absorbed rank)
-Σ 98.6 ms GPU-kernel self time, 2068 launches:
+## Finding 1 — ~96 ms compute/GPU + ~44% idle; the idle hides in one sync kernel
+Per-GPU, real nsys kernel durations (L=4096 prefill):
 ```
-component                              ms      %   launches
-MoE (FP4 experts + route)           36.3   36.8%      446
-attention (FA4 + sconv/rel/sink)    34.7   35.2%      988
-dense GEMM (qkv/o/shared/router)    24.8   25.1%      335
-glue / quant / norm                  2.7    2.8%      298
-allreduce/comm (in-trace)            0.02   0.0%        1
+ GPU   total_ms   _reduce_insert_ms   compute_ms(excl sync)
+   0     161.5           65.0                 96.5
+   1     172.8           76.6                 96.2
+   2     172.7           76.3                 96.4
+   3      98.4            2.7                 95.7   <- lead rank this run
 ```
-Top kernels (name → identity):
+**Compute is ~96 ms on every rank** (the calibrated per-prefill number; torch-profiler
+rank0 agreed at 98.6 ms). `_reduce_insert_kernel` is a per-layer cross-rank sync (132
+launches/GPU = 2×/layer): **2.7 ms on the lead, 65–77 ms of spin-wait on the other 3**.
+Same wall (~170 ms) on all ranks = ~96 ms compute + ~74 ms idle each; the lead shows
+idle as inter-kernel gaps, the waiters as inflated `_reduce_insert`. So at C=1 the
+forward is **~56% compute / ~44% idle** — the textbook latency/launch/sync-bound
+signature, and exactly the idle that FULL CUDA-graphs (prefill daylog T4) and batching
+(T3/EC3) recover. Note compute is *balanced* across ranks, so the sync bubble is
+launch-gap + sync latency, not EP token-routing load imbalance.
+
+## Finding 2 — the compute map (nsys, per GPU, L=4096)
+~96.2 ms compute/GPU, excluding the `_reduce_insert` sync:
 ```
- 15.8ms  bmm_E2m1_E2m1E2m1_Fp32_... (×63)   MoE expert GEMM, FP4 (E2M1) tensor-core
- 14.5ms  nvjet_sm100_tst_128x256... (×196)  dense GEMM (cuBLASLt sm100): qkv/o/shared
- 13.3ms  bmm_Bfloat16_E2m1E2m1_...  (×63)   MoE expert GEMM, bf16×FP4
-  9.1ms  _sconv_publish_kernel      (×132)  Inkling attention: short-conv publish
-  7.9ms  _publish_input_kernel      (×132)  attention data movement
-  6.2ms  nvjet_sm100_tst_...        (×57)   dense GEMM
-  4.7ms  moe::dev::finalize::...    (×63)   MoE combine expert outputs
-  4.6ms  _gather_norm_kernel        (×132)  attention gather + norm
-  3.0ms  ...fa4flash_fwd...         (×55)   FlashAttention-4 forward (the actual attn)
-  2.7ms  _reduce_insert_kernel      (×132)  KV reduce/insert (the C=1 sync point)
-  2.2ms  ...fa4shearing...          (×55)   FA4 shearing (rel-pos variant)
-  1.2ms  _inkling_gate_select       (×64)   MoE routing (top-6 of 256)
-  1.1ms  _rel_proj_throughput       (×66)   relative-position projection (d_rel=16)
-  1.0ms  _kv_kernel / _sink_epilogue(×64)   KV proj / attention sink
-  0.6ms  cvt_fp16_to_fp4_sf         (×63)   activation → FP4 quant for MoE
+component                            ms/GPU   %compute   launches/GPU
+MoE (FP4 experts + route)             36.1     37.5%        443
+attention (FA4 + sconv/rel/sink)      33.3     34.6%        922
+dense GEMM (qkv/o/shared/router)      22.8     23.7%        329
+elementwise/glue                       3.9      4.1%        240
+norm                                   0.0      0.0%          2
+```
+Top kernels by real GPU time (per-instance avg, aggregate over 4 GPUs):
+```
+  kernel                                  inst   avg_ns    what it is
+  bmm_E2m1_E2m1E2m1_Fp32_...               252   247,207   MoE expert GEMM, FP4 (E2M1) tensor-core
+  nvjet_sm100_tst_128x256_..._h            784    72,289   dense GEMM (cuBLASLt sm100): qkv/o/shared
+  bmm_Bfloat16_E2m1E2m1_...                252   208,832   MoE expert GEMM, bf16×FP4
+  _sconv_publish_kernel                    528    69,667   Inkling attn: short-conv publish
+  _publish_input_kernel                    528    63,982   attn data movement
+  nvjet_sm100_tst_128x256_..._v            228   108,498   dense GEMM
+  moe::dev::finalize::finalizeKernel...    252    74,130   MoE combine expert outputs
+  fa4flash_fwd_sm100...                    220    54,764   FlashAttention-4 forward (the actual attn)
+  _gather_norm_kernel                      528    36,519   attn gather + norm
+  fa4shearing_biasShearingBias...          220    39,242   FA4 shearing (rel-pos)
+  _inkling_gate_select_kernel              256    19,351   MoE routing (top-6 of 256)
+  _rel_proj_throughput_kernel              264    17,171   relative-position projection (d_rel=16)
+  _kv_kernel / _sink_epilogue_kernel       264    ~15,400  KV proj / attention sink
+  cvt_fp16_to_fp4_sf_major                 252     9,619   activation → FP4 quant for MoE
+  routingIndicesClusterKernel              252     9,549   MoE expert routing
 ```
 
 ## Reading the architecture off the kernels
-- **MoE experts run on native FP4 tensor cores** — the `bmm_*E2m1*` kernels (E2M1 = FP4).
-  Confirms the `FLASHINFER_TRTLLM` backend uses the Blackwell FP4 path, no bf16
-  upconvert. ~37% of compute for top-6-of-256 routing + 2 shared experts.
-- **Attention ≠ FlashAttention.** The FA4 math (`fa4flash`+`fa4shearing`) is only ~7 ms;
-  the other ~24 ms of the attention bucket is Inkling's own machinery — `_sconv_*`
-  (short convolution over the sequence), `_rel_proj` (relative position, `d_rel=16`,
-  `rel_extent=1024` from config), `_sink_epilogue` (attention sink; `shared_expert_sink`
-  in config), plus `_publish`/`_gather`/`_reduce_insert` data movement. All at **132
-  launches = 2× per layer** — many tiny, movement/launch-bound kernels. This is the
-  distinctive part of the model and the biggest bag of small kernels.
-- **Dense GEMMs are cuBLASLt `nvjet` sm100** (qkv / o_proj / shared-expert / router),
-  ~25%.
-- **norm ~0, in-trace allreduce ~0**: RMSNorm is fused (`fuse_norm_quant`); TP
-  all-reduce cost is hidden inside the `_reduce_insert` sync rather than a named NCCL
-  kernel at this size.
+- **MoE experts run on native FP4 tensor cores** — the two `bmm_*E2m1*` kernels (E2M1 =
+  FP4) are the largest compute item: (247+209 µs) × 63/GPU ≈ **28.7 ms/GPU**, confirming
+  the `FLASHINFER_TRTLLM` backend uses the Blackwell FP4 path (no bf16 upconvert).
+  +finalize/routing/gate ≈ 7 ms. ~37.5% of compute for top-6-of-256 + 2 shared experts.
+- **Attention ≠ FlashAttention.** FA4 math (`fa4flash`+`fa4shearing`+`fa4cu_blocks`) is
+  only ~7 ms/GPU; the other ~26 ms is Inkling's own machinery — `_sconv_*` (short conv
+  over the sequence), `_rel_proj` (relative position, `d_rel=16`, `rel_extent=1024`),
+  `_sink_epilogue` (attention sink; `shared_expert_sink` in config), plus
+  `_publish`/`_gather` data movement. Many tiny kernels at **132 launches/GPU = 2×/layer**
+  — movement/launch-bound. This is the model's distinctive part and the biggest bag of
+  small kernels driving the launch-gap idle.
+- **Dense GEMMs are cuBLASLt `nvjet` sm100** (qkv/o_proj/shared-expert/router), ~23 ms.
+- **RMSNorm ~0** (fused via `fuse_norm_quant`); TP all-reduce doesn't appear as a named
+  NCCL kernel — its cost is inside the `_reduce_insert` sync.
 
-## Caveats — what is and isn't trustworthy here
-- **Relative shares, kernel identities, and the idle/sync structure are robust** (cross-
-  validated across all 4 ranks).
-- **Absolute compute magnitude and length-scaling are NOT.** A second capture at L=2048
-  gave 15.1 ms rank0 compute vs 98.6 ms at 4096 — 6.5× for 2× tokens, uniform across
-  buckets — which is non-physical. Cause: the async engine loop + torch profiler's
-  default `active_iterations=5` schedule capture a variable amount of work around a
-  single `/start_profile`→`/stop_profile` prefill. Treat the ms values as within-trace
-  proportions, not calibrated per-token costs.
+## What changed vs the torch-profiler pass
+Nsight **confirms the proportions** (MoE 37 / attn 35 / GEMM 24) and **calibrates the
+magnitudes** the torch profiler couldn't: ~96 ms compute/GPU (not the 15-vs-99 ms mess
+the async window produced), and it pins the `_reduce_insert` sync at 65–77 ms of real
+spin-wait on 3 ranks. The one open item from the previous daylog — "absolute magnitude
+unresolved" — is now resolved.
 
 ## Open (next)
-- Pin the capture window: `--profiler-config.max_iterations=1` (+ `active_iterations=1`,
-  `ignore_frontend=true`) or drive via `nsys` for a single clean forward, then redo the
-  L-sweep to get real per-token scaling per bucket.
-- Resolve the `_reduce_insert` rank0-vs-rest imbalance (why one rank runs ~93 ms longer
-  before the sync) — is it root-heavy reduction, EP routing serialization, or a
-  genuine load imbalance across the expert-parallel groups?
-- Profile a decode step (out of scope for this pass) if the decode path ever matters.
+- **Length scaling done right:** repeat the nsys capture at L∈{1024,2048,6144} to get
+  real per-token cost per bucket (MoE/GEMM ∝ tokens, attention movement partly fixed).
+- **The ~44% idle:** re-profile in the *graphed* config (not eager) under nsys to
+  measure how much of the 74 ms idle the CUDA graphs actually remove, and what sync
+  residual remains — ties directly to the T4 result.
+- **Decode step** if it ever matters (out of scope here).
 
 ```
 Box: 4× B200 183 GiB, vLLM 0.1.dev18898+g93d5b2187 (inkling), NVFP4, TP=4 + EP,
---enforce-eager, torch profiler. Scripts: prof_prefill.py, parse_trace.py.
+--enforce-eager. Nsight Systems 2024.6.2, cudaProfilerApi capture range.
+Scripts: prof_prefill.py, parse_trace.py, launch_nsys.sh.
 ```
