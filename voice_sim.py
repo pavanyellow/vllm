@@ -34,7 +34,7 @@ _WORDS = ("account balance transfer payment savings credit limit due date amount
 
 
 def make_context(target_tokens, rng):
-    # ~1.4 tokens/word for this tokenizer; build a fixed filler "reference doc".
+    # ~1.05 tokens/word for this vocabulary; build a fixed filler "reference doc".
     n_words = max(1, int(target_tokens / 1.05))
     return "Reference context: " + " ".join(rng.choice(_WORDS) for _ in range(n_words))
 UTTERANCES = [
@@ -55,6 +55,7 @@ _inflight = 0
 _peak = 0
 _busy_seconds = 0.0
 _inflight_samples = []   # concurrency seen at each request's send time
+_errors = {}             # non-200 status / exception name / "no_token" -> count
 
 
 async def one_turn(client, url, model, messages, max_tokens):
@@ -72,6 +73,10 @@ async def one_turn(client, url, model, messages, max_tokens):
     t0 = time.perf_counter()
     try:
         async with client.stream("POST", url, json=payload) as r:
+            if r.status_code != 200:
+                _errors[r.status_code] = _errors.get(r.status_code, 0) + 1
+                await r.aread()
+                return None, time.perf_counter() - t0, "", None
             async for line in r.aiter_lines():
                 if not line.startswith("data:"):
                     continue
@@ -85,11 +90,16 @@ async def one_turn(client, url, model, messages, max_tokens):
                 if obj.get("usage"):
                     prompt_tokens = obj["usage"].get("prompt_tokens")
                 if obj.get("choices"):
-                    if ttft is None:
+                    d = obj["choices"][0].get("delta") or {}
+                    # first real token (text or tool call), not the role-only chunk
+                    if ttft is None and (d.get("content") or d.get("tool_calls")):
                         ttft = time.perf_counter() - t0
-                    delta = obj["choices"][0]["delta"].get("content")
-                    if delta:
-                        text += delta
+                    if d.get("content"):
+                        text += d["content"]
+        if ttft is None:
+            _errors["no_token"] = _errors.get("no_token", 0) + 1
+    except Exception as e:  # count, don't kill the whole run
+        _errors[type(e).__name__] = _errors.get(type(e).__name__, 0) + 1
     finally:
         total = time.perf_counter() - t0
         _busy_seconds += total
@@ -134,6 +144,10 @@ def pct(xs, q):
 async def main_async(a):
     deadline = time.perf_counter() + a.duration
     results = []
+    # Per-run salt at the very start of every system prompt: contexts are seeded
+    # by call index, so without it each level of a sweep re-sends the previous
+    # level's prompts and its "cold" turns hit a warm cache (overstated capacity).
+    salt = a.salt or f"{random.getrandbits(32):08x}"
     ptoks = []
     ctx_on = a.ctx_max > 0
 
@@ -146,7 +160,7 @@ async def main_async(a):
     # Assign each call a system prompt. --groups "30,30" => two SHARED groups of
     # 30% (identical content within a group), remaining 40% UNIQUE per call.
     group_pcts = [float(x) for x in a.groups.split(",")] if a.groups else []
-    shared_sys = [f"{SYSTEM} (group {g}){ctx_for(0x5ADE5 ^ g)}"
+    shared_sys = [f"[run {salt}] {SYSTEM} (group {g}){ctx_for(0x5ADE5 ^ g)}"
                   for g in range(len(group_pcts))]
     assign = []
     for g, gp in enumerate(group_pcts):
@@ -154,7 +168,7 @@ async def main_async(a):
     assign = assign[:a.calls]
     while len(assign) < a.calls:
         cid = len(assign)
-        assign.append(f"{SYSTEM} (session {cid}){ctx_for(0xC0FFEE ^ cid)}")
+        assign.append(f"[run {salt}] {SYSTEM} (session {cid}){ctx_for(0xC0FFEE ^ cid)}")
     n_shared = sum(round(a.calls * p / 100.0) for p in group_pcts)
 
     limits = httpx.Limits(max_connections=a.calls + 10, max_keepalive_connections=a.calls + 10)
@@ -174,10 +188,12 @@ async def main_async(a):
            if group_pcts else "")
     print(f"calls={a.calls} duration={a.duration}s gap={a.gap_min}-{a.gap_max}s "
           f"max_tokens={a.max_tokens} cache={'OFF' if a.no_cache else 'ON'} "
-          f"ctx={a.ctx_min:.0f}-{a.ctx_max:.0f}{mix}")
+          f"ctx={a.ctx_min:.0f}-{a.ctx_max:.0f}{mix} salt={salt}")
+    sent = len(_inflight_samples)
+    print(f"errors          : {sum(_errors.values())} of {sent} requests {dict(_errors) if _errors else ''}")
     print(f"turns completed : {len(results)}  ({len(results)/wall:.1f} req/s avg){ptinfo}")
     print(f"TTFT ms  p50={pct(results,.50)*1e3:.1f}  p90={pct(results,.90)*1e3:.1f}  "
-          f"p99={pct(results,.99)*1e3:.1f}  max={max(results)*1e3:.1f}")
+          f"p99={pct(results,.99)*1e3:.1f}  max={max(results)*1e3:.1f}" if results else "TTFT: none (every request failed)")
     print(f"in-flight: PEAK={_peak}  avg(time-weighted)={_busy_seconds/wall:.2f}  "
           f"(active calls={a.calls})")
     # concurrency-at-send histogram
@@ -202,6 +218,9 @@ def parse_args():
                    help="min per-call reference-context target tokens (0 = short mode)")
     p.add_argument("--ctx-max", type=float, default=0.0,
                    help="max per-call reference-context target tokens")
+    p.add_argument("--salt", default="",
+                   help="cache namespace for this run (default: random). Reuse a salt only "
+                        "to measure deliberately warm caches")
     p.add_argument("--groups", default="",
                    help="comma %% of calls sharing each system prompt, e.g. '30,30' "
                         "=> two shared groups, remainder unique per call")

@@ -14,6 +14,22 @@ through a *shared* context and prefill collapses **460×** (20k → 43 tok/s) an
 flat. The residual latency past that is the model's intrinsic ~50 ms/forward cost, not
 caching.
 
+> **Correction (2026-10-03).** Three issues in the drivers used here, fixed in
+> `voice_sim.py` / `voice_sim_prod.py`:
+> 1. **Warm caches across levels.** Contexts were seeded only by call/line index
+>    (`0xC0FFEE ^ cid`, groups `0x5ADE5 ^ g`; prod records by `(line_id, caller_seq)`,
+>    tenant `Random(7)`), so every level of a sweep re-sent the previous level's
+>    prompts. "Cold" first turns could hit a warm cache. Affected: V1 (50 → 100 → 200),
+>    V2/V4 arms run back-to-back, V5 levels. Capacity numbers here are **optimistic
+>    upper bounds** where a level ran after another; V4's hit rates in particular
+>    include leftovers from earlier arms. Now: a random per-run `--salt` is the first
+>    token of every system prompt.
+> 2. **Errors were invisible.** Non-200 / exceptions / no-token replies were dropped
+>    from the stats (`voice_sim_prod.py` swallowed every exception). Now counted and
+>    printed (`errors: N of M`).
+> 3. **TTFT** in `voice_sim.py` started at the first chunk of any kind (can be the
+>    role-only delta); now at the first content or tool-call token.
+
 ## Setup
 - Model served with thinking **OFF** — Inkling is a reasoning model; per-request
   `chat_template_kwargs={"reasoning_effort":"none"}` (maps via the chat template's

@@ -51,6 +51,7 @@ UTTERANCES = [
 _inflight = 0
 _peak = 0
 _busy_seconds = 0.0
+_errors = {}  # non-200 status / exception name / "no_token" -> count
 
 
 def make_text(target_tokens, rng):
@@ -76,6 +77,10 @@ async def one_request(client, url, model, messages, max_tokens, cancel_after=Non
     t0 = time.perf_counter()
     try:
         async with client.stream("POST", url, json=payload) as r:
+            if r.status_code != 200:
+                _errors[r.status_code] = _errors.get(r.status_code, 0) + 1
+                await r.aread()
+                ttft = -1  # counted as an error above, not as "no_token"
             async for line in r.aiter_lines():
                 if not line.startswith("data:"):
                     continue
@@ -101,8 +106,12 @@ async def one_request(client, url, model, messages, max_tokens, cancel_after=Non
                             ttfs = time.perf_counter() - t0
                         if cancel_after is not None and chunks >= cancel_after:
                             break  # barge-in: close the stream
-    except Exception:
-        pass
+        if ttft is None:
+            _errors["no_token"] = _errors.get("no_token", 0) + 1
+        elif ttft == -1:
+            ttft = None
+    except Exception as e:  # count, never hide
+        _errors[type(e).__name__] = _errors.get(type(e).__name__, 0) + 1
     finally:
         total = time.perf_counter() - t0
         _busy_seconds += total
@@ -175,7 +184,11 @@ def pct(xs, q):
 
 async def main_async(a):
     deadline = time.perf_counter() + a.duration
-    tenant_prompt = f"{SYSTEM}\n\nCampaign brief:\n{make_text(a.tenant_tokens, random.Random(7))}"
+    # Per-run salt first in the system prompt: tenant prompt and caller records are
+    # seeded deterministically (line id / caller seq), so without it each sweep level
+    # re-sends the previous level's prompts and hits a warm cache.
+    salt = a.salt or f"{random.getrandbits(32):08x}"
+    tenant_prompt = f"[run {salt}] {SYSTEM}\n\nCampaign brief:\n{make_text(a.tenant_tokens, random.Random(7))}"
     stats = {"ttft": [], "ttfs": [], "ptok": [], "dials": 0, "connects": 0,
              "turns": 0, "tool_turns": 0, "barge_ins": 0}
     limits = httpx.Limits(max_connections=a.dialed + 10,
@@ -193,7 +206,8 @@ async def main_async(a):
     print(f"dialed_lines={a.dialed} connect_rate={a.connect_rate} duration={a.duration}s "
           f"tenant={a.tenant_tokens}tok record={a.record_tokens}tok "
           f"tool_prob={a.tool_prob} cancel_prob={a.cancel_prob} "
-          f"gaps={a.gap_min}-{a.gap_max}s turns/call~{a.turns_per_call}")
+          f"gaps={a.gap_min}-{a.gap_max}s turns/call~{a.turns_per_call} salt={salt}")
+    print(f"errors: {sum(_errors.values())} {dict(_errors) if _errors else ''}")
     print(f"dials={r['dials']}  connects={r['connects']} "
           f"({100*r['connects']/max(1,r['dials']):.0f}%)  turns={r['turns']} "
           f"({r['turns']/wall:.1f} turns/s)  tool_turns={r['tool_turns']}  "
@@ -214,6 +228,7 @@ async def main_async(a):
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--url", default="http://127.0.0.1:8000/v1/chat/completions")
+    p.add_argument("--salt", default="", help="cache namespace for this run (default: random)")
     p.add_argument("--model", default="thinkingmachines/Inkling-NVFP4")
     p.add_argument("--dialed", type=int, default=200, help="concurrent dialer lines")
     p.add_argument("--connect-rate", type=float, default=0.10)
